@@ -1,0 +1,11 @@
+
+order:
+  outbox:
+    delay: 2000 # 2 seconds
+    retention-delay: 7d # Garde les "SENT" pendant 7 jours
+  inbox:
+    purge-delay: 24h # Purge après 24 heures
+  saga:
+    retention-delay: 7d # Garde les sagas terminées pendant 7 jours
+  consumer:
+    nak-delay: 2s

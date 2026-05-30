@@ -1,0 +1,9 @@
+
+inventory:
+  consumer:
+    nak-delay: 2s
+  inbox:
+    purge-delay: 24h # Purge les verrous après 24h
+  outbox:
+    delay: 2000 # Le scheduler lira l'outbox toutes les 2s
+    retention-delay: 7d # Garde les messages 'SENT' pendant 7 jours
