@@ -7,6 +7,7 @@ import com.poc.modules.inventory.contract.events.StockReservedEvent;
 import com.poc.modules.order.contract.events.OrderCancelledEvent;
 import com.poc.modules.order.contract.events.OrderValidatedEvent;
 import com.poc.modules.order.contract.events.ReserveStockCommand;
+import com.poc.platform.messaging.DuplicateMessageException;
 import com.poc.platform.messaging.InboxFilter;
 import com.poc.shared.event.DomainEvent;
 import io.nats.client.*;
@@ -158,23 +159,34 @@ public class OrderSagaManager {
     // MÉTHODES UTILITAIRES (Sécurisées)
     // ===================================================================================
     private <T extends DomainEvent> void processSagaResponse(Message msg, Class<T> eventClass, Consumer<T> logic) {
+        T event = null;
         try {
-            T event = objectMapper.readValue(new String(msg.getData()), eventClass);
+            // 1. Désérialisation de l'événement
+            event = objectMapper.readValue(new String(msg.getData()), eventClass);
+            final T finalEvent = event;
 
+            // 2. Exécution du filtre d'idempotence et de la logique métier
             // L'inbox filter et la transaction globale entourent tout le traitement
-            inboxFilter.processSafely("order_schema", event.eventId(), "OrderSagaManager", () -> {
-                txTemplate.executeWithoutResult(status -> logic.accept(event));
+            inboxFilter.processSafely("order_schema", finalEvent.eventId(), "OrderSagaManager", () -> {
+                txTemplate.executeWithoutResult(status -> logic.accept(finalEvent));
             });
+
+            // 3. Succès nominal : On acquitte le message auprès de NATS
+            msg.ack();
+        }  catch (DuplicateMessageException e) {
+            // CAS DU DOUBLON : L'événement a déjà été traité avec succès par le passé.
+            // On effectue un ACK pour dire à NATS de ne plus nous renvoyer ce message.
+            UUID eventId = (event != null) ? event.eventId() : null;
+            log.info("[Saga] Doublon détecté pour l'événement {} dans l'Inbox. Message acquitté (ACK) pour stopper la boucle.", eventId);
             msg.ack();
         } catch (Exception e) {
-            log.error("Erreur de traitement de la Saga, rollback du message", e);
-            // 1. On récupère la Duration ou une valeur par défaut de 2 secondes
-            Duration nakDuration = properties.consumer() != null ? properties.consumer().nakDelay() : Duration.ofSeconds(2);
+            // CAS D'ÉCHEC RÉEL : Erreur technique, crash base de données, deadlock, etc.
+            // La transaction a été annulée. On envoie un NAK pour rejouer le message plus tard.
+            log.error("[Saga] Vraie erreur de traitement lors de la réponse de la Saga. Envoi d'un NAK avec délai.", e);
 
-            // 2. On extrait les millisecondes sous forme de primitif long pour l'API NATS
+            Duration nakDuration = properties.consumer() != null ? properties.consumer().nakDelay() : Duration.ofSeconds(2);
             long delayMillis = nakDuration.toMillis();
 
-            // 3. Envoi du NAK à NATS avec le long attendu
             msg.nakWithDelay(delayMillis);
         }
     }
