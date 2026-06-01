@@ -3,6 +3,7 @@ package com.poc.modules.notification.internal;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.poc.modules.order.contract.events.OrderCancelledEvent;
 import com.poc.modules.order.contract.events.OrderValidatedEvent;
+import com.poc.platform.messaging.DuplicateMessageException;
 import com.poc.platform.messaging.InboxFilter;
 import com.poc.shared.event.DomainEvent;
 import io.nats.client.*;
@@ -15,6 +16,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
+import java.util.UUID;
 import java.util.function.Consumer;
 
 @Component
@@ -71,19 +73,28 @@ public class NotificationConsumer {
 
     // Le Wrapper Transactionnel (La clé de l'architecture)
     private <T extends DomainEvent> void processSafelyAndSchedule(Message msg, Class<T> eventClass, Consumer<T> logic) {
+        T event = null;
         try {
-            T event = objectMapper.readValue(new String(msg.getData()), eventClass);
+            event = objectMapper.readValue(new String(msg.getData()), eventClass);
+            final T finalEvent = event;
 
-            // 1. L'Inbox protège des doublons NATS
-            inboxFilter.processSafely("notification_schema", event.eventId(), "NotificationConsumer", () -> {
-
-                // 2. Le @Transactional englobe la création du JobRunr
-                txTemplate.executeWithoutResult(status -> logic.accept(event));
+            inboxFilter.processSafely("notification_schema", finalEvent.eventId(), "NotificationConsumer", () -> {
+                txTemplate.executeWithoutResult(status -> logic.accept(finalEvent));
             });
+
             msg.ack();
+
+        } catch (DuplicateMessageException e) {
+            // C'est un doublon de notification. L'e-mail a déjà été planifié par le passé.
+            // On envoie un ACK pour sortir le message de la boucle NATS.
+            UUID eventId = (event != null) ? event.eventId() : null;
+            log.info("[Notification] Doublon détecté pour l'événement {}. Message acquitté (ACK).", eventId);
+            msg.ack();
+
         } catch (Exception e) {
-            log.error("Erreur de notification", e);
-            msg.nakWithDelay(Duration.ofSeconds(2));
+            log.error("Erreur technique de notification (Crash DB, JSON corrompu...). Envoi d'un NAK.", e);
+            // Correction de l'API NATS Java (nakWithDelay attend des millisecondes en type long)
+            msg.nakWithDelay(Duration.ofSeconds(2).toMillis());
         }
     }
 }
